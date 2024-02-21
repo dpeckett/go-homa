@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"io"
 	"log"
 	"net"
@@ -24,7 +23,7 @@ func main() {
 	log.Printf("Listening for RPC messages on %s", s.LocalAddr().String())
 
 	for {
-		msg, err := s.Recv(context.TODO())
+		msg, err := s.Recv()
 		if err != nil {
 			log.Fatal(err)
 		}

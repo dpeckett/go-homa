@@ -20,6 +20,7 @@ package homa_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
@@ -52,37 +53,58 @@ func TestHomaRPC(t *testing.T) {
 	clientSock, err := homa.NewSocket(clientAddr)
 	require.NoError(t, err)
 
-	var g errgroup.Group
+	g, ctx := errgroup.WithContext(context.Background())
+
+	ctx, cancel := context.WithCancel(ctx)
 
 	g.Go(func() error {
-		for {
-			msg, err := serverSock.Recv()
-			if err != nil {
-				if errors.Is(err, net.ErrClosed) {
-					return nil
+		defer serverSock.Close()
+
+		errCh := make(chan error, 1)
+		defer close(errCh)
+
+		go func() {
+			for {
+				msg, err := serverSock.Recv()
+				if err != nil {
+					if errors.Is(err, net.ErrClosed) {
+						errCh <- nil
+						return
+					}
+
+					errCh <- err
+					return
 				}
 
-				return err
-			}
+				h := sha256.New()
+				if _, err := io.Copy(h, msg); err != nil {
+					errCh <- err
+					return
+				}
 
-			h := sha256.New()
-			if _, err := io.Copy(h, msg); err != nil {
-				return err
-			}
+				if err := msg.Close(); err != nil {
+					errCh <- err
+					return
+				}
 
-			if err := msg.Close(); err != nil {
-				return err
+				if err := serverSock.Reply(msg.PeerAddr(), msg.ID(), h.Sum(nil)); err != nil {
+					errCh <- err
+					return
+				}
 			}
+		}()
 
-			if err := serverSock.Reply(msg.PeerAddr(), msg.ID(), h.Sum(nil)); err != nil {
-				return err
-			}
+		select {
+		case <-ctx.Done():
+			return nil
+		case err := <-errCh:
+			return err
 		}
 	})
 
 	g.Go(func() error {
 		defer clientSock.Close()
-		defer serverSock.Close()
+		defer cancel()
 
 		for i := 0; i < 100; i++ {
 			size, err := rand.Int(rand.Reader, big.NewInt(homa.HOMA_MAX_MESSAGE_LENGTH-1))

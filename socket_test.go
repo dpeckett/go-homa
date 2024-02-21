@@ -20,7 +20,6 @@ package homa_test
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
@@ -47,17 +46,19 @@ func TestHomaRPC(t *testing.T) {
 	serverSock, err := homa.NewSocket(serverAddr)
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	clientAddr, err := net.ResolveUDPAddr("udp", "localhost:0")
+	require.NoError(t, err)
 
-	g, ctx := errgroup.WithContext(ctx)
+	clientSock, err := homa.NewSocket(clientAddr)
+	require.NoError(t, err)
+
+	var g errgroup.Group
 
 	g.Go(func() error {
-		defer serverSock.Close()
-
 		for {
-			msg, err := serverSock.Recv(ctx)
+			msg, err := serverSock.Recv()
 			if err != nil {
-				if errors.Is(err, context.Canceled) {
+				if errors.Is(err, net.ErrClosed) {
 					return nil
 				}
 
@@ -80,18 +81,8 @@ func TestHomaRPC(t *testing.T) {
 	})
 
 	g.Go(func() error {
-		defer cancel()
-
-		clientAddr, err := net.ResolveUDPAddr("udp", "localhost:0")
-		if err != nil {
-			return err
-		}
-
-		clientSock, err := homa.NewSocket(clientAddr)
-		if err != nil {
-			return err
-		}
 		defer clientSock.Close()
+		defer serverSock.Close()
 
 		for i := 0; i < 100; i++ {
 			size, err := rand.Int(rand.Reader, big.NewInt(homa.HOMA_MAX_MESSAGE_LENGTH-1))
@@ -115,7 +106,7 @@ func TestHomaRPC(t *testing.T) {
 				return fmt.Errorf("expected message id > 0, got %d", id)
 			}
 
-			msg, err := clientSock.Recv(ctx)
+			msg, err := clientSock.Recv()
 			if err != nil {
 				return err
 			}

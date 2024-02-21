@@ -20,6 +20,9 @@ package homa
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
+	"net"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -37,14 +40,69 @@ func ntohs(net uint16) uint16 {
 	return binary.BigEndian.Uint16(unsafe.Slice((*byte)(unsafe.Pointer(&net)), 2))
 }
 
+// recvmsg is a wrapper around the recvmsg system call, this is not natively exposed to go but
+// we need to make some tweaks to the msghdr struct so we'll define our own.
+func recvmsg(s int, msg *unix.Msghdr, flags int) (n int, err error) {
+	err = unix.EINTR
+	for errors.Is(err, unix.EINTR) {
+		r0, _, e1 := unix.Syscall(unix.SYS_RECVMSG, uintptr(s), uintptr(unsafe.Pointer(msg)), uintptr(flags))
+		n = int(r0)
+		if e1 != 0 {
+			err = unix.Errno(e1)
+		} else {
+			err = nil
+		}
+	}
+	return
+}
+
 // sendmsg is a wrapper around the sendmsg system call, this is not natively exposed to go but
 // we need to make some tweaks to the msghdr struct so we'll define our own.
 func sendmsg(s int, msg *unix.Msghdr, flags int) (n int, err error) {
-	r0, _, e1 := unix.Syscall(unix.SYS_SENDMSG, uintptr(s), uintptr(unsafe.Pointer(msg)), uintptr(flags))
-	n = int(r0)
-	if e1 != 0 {
-		err = unix.Errno(e1)
-		return
+	err = unix.EINTR
+	for errors.Is(err, unix.EINTR) {
+		r0, _, e1 := unix.Syscall(unix.SYS_SENDMSG, uintptr(s), uintptr(unsafe.Pointer(msg)), uintptr(flags))
+		n = int(r0)
+		if e1 != 0 {
+			err = unix.Errno(e1)
+		} else {
+			err = nil
+		}
 	}
 	return
+}
+
+func setsockoptHomaBuf(fd int, args SetBufArgs) (err error) {
+	err = unix.EINTR
+	for errors.Is(err, unix.EINTR) {
+		_, _, e1 := unix.Syscall6(unix.SYS_SETSOCKOPT, uintptr(fd), IPPROTO_HOMA, SO_HOMA_SET_BUF, uintptr(unsafe.Pointer(&args)), unsafe.Sizeof(args), 0)
+		if e1 != 0 {
+			err = unix.Errno(e1)
+		} else {
+			err = nil
+		}
+	}
+	return
+}
+
+// toRawSockAddr converts a net.Addr to a raw socket address.
+func toRawSockAddr(addr net.Addr) (unsafe.Pointer, uint32, error) {
+	switch addr := addr.(type) {
+	case *net.UDPAddr:
+		if ipv4 := addr.IP.To4(); ipv4 != nil {
+			return unsafe.Pointer(&unix.RawSockaddrInet4{
+				Family: unix.AF_INET,
+				Port:   htons(uint16(addr.Port)),
+				Addr:   [4]byte(ipv4),
+			}), unix.SizeofSockaddrInet4, nil
+		}
+
+		return unsafe.Pointer(&unix.RawSockaddrInet6{
+			Family: unix.AF_INET6,
+			Port:   htons(uint16(addr.Port)),
+			Addr:   [16]byte(addr.IP),
+		}), unix.SizeofSockaddrInet6, nil
+	default:
+		return nil, 0, fmt.Errorf("unsupported address type: %T", addr)
+	}
 }

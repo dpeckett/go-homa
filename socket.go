@@ -19,7 +19,6 @@
 package homa
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -30,9 +29,8 @@ import (
 )
 
 type Socket struct {
-	fd            int
-	bp            *BufferPool
-	dataAvailable chan struct{}
+	fd int
+	bp *BufferPool
 }
 
 func NewSocket(listenAddr net.Addr) (*Socket, error) {
@@ -41,23 +39,21 @@ func NewSocket(listenAddr net.Addr) (*Socket, error) {
 		return nil, fmt.Errorf("could not open homa socket: %w", err)
 	}
 
-	var rawListenAddr unix.Sockaddr
-	{
-		udpAddr, ok := listenAddr.(*net.UDPAddr)
-		if !ok {
-			return nil, fmt.Errorf("unsupported address type")
-		}
-
-		if ipv4 := udpAddr.IP.To4(); ipv4 != nil {
-			rawListenAddr = &unix.SockaddrInet4{Port: udpAddr.Port, Addr: [4]byte(ipv4)}
-		} else if ipv6 := udpAddr.IP.To16(); ipv6 != nil {
-			rawListenAddr = &unix.SockaddrInet6{Port: udpAddr.Port, Addr: [16]byte(ipv6)}
+	var rawSockAddr unix.Sockaddr
+	switch listenAddr := listenAddr.(type) {
+	case *net.UDPAddr:
+		if ipv4 := listenAddr.IP.To4(); ipv4 != nil {
+			rawSockAddr = &unix.SockaddrInet4{Port: listenAddr.Port, Addr: [4]byte(ipv4)}
+		} else if ipv6 := listenAddr.IP.To16(); ipv6 != nil {
+			rawSockAddr = &unix.SockaddrInet6{Port: listenAddr.Port, Addr: [16]byte(ipv6)}
 		} else {
 			return nil, fmt.Errorf("unsupported address family")
 		}
+	default:
+		return nil, fmt.Errorf("unsupported address type")
 	}
 
-	err = unix.Bind(fd, rawListenAddr)
+	err = unix.Bind(fd, rawSockAddr)
 	if err != nil {
 		_ = unix.Close(fd)
 
@@ -81,47 +77,9 @@ func NewSocket(listenAddr net.Addr) (*Socket, error) {
 		return nil, fmt.Errorf("could not set homa buffer: %w", err)
 	}
 
-	epfd, err := unix.EpollCreate1(0)
-	if err != nil {
-		_ = unix.Close(fd)
-
-		return nil, fmt.Errorf("could not create epoll: %w", err)
-	}
-
-	event := &unix.EpollEvent{
-		Events: unix.EPOLLIN,
-		Fd:     int32(fd),
-	}
-	if err := unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, fd, event); err != nil {
-		_ = unix.Close(fd)
-		_ = unix.Close(epfd)
-
-		return nil, fmt.Errorf("could not add epoll event: %w", err)
-	}
-
-	dataAvailable := make(chan struct{}, 1)
-
-	go func() {
-		defer close(dataAvailable)
-		defer unix.Close(epfd)
-
-		events := make([]unix.EpollEvent, 1)
-		for {
-			n, err := unix.EpollWait(epfd, events, 10)
-			if err != nil && !errors.Is(err, unix.EINTR) {
-				return
-			}
-
-			if n > 0 {
-				dataAvailable <- struct{}{}
-			}
-		}
-	}()
-
 	return &Socket{
-		fd:            fd,
-		bp:            bp,
-		dataAvailable: dataAvailable,
+		fd: fd,
+		bp: bp,
 	}, nil
 }
 
@@ -161,38 +119,33 @@ func (s *Socket) LocalAddr() net.Addr {
 }
 
 // Recv waits for an incoming RPC and returns a message containing the RPC's data.
-// The flags argument specifies the type of RPC to receive. It returns a message
-// containing the RPC's data, or an error if the operation failed.
-func (s *Socket) Recv(ctx context.Context) (*Message, error) {
+// It returns a message containing the RPC's data, or an error if the operation failed.
+func (s *Socket) Recv() (*Message, error) {
 	args := RecvmsgArgs{
-		Flags: HOMA_RECVMSG_REQUEST | HOMA_RECVMSG_RESPONSE | HOMA_RECVMSG_NONBLOCKING,
+		Flags: HOMA_RECVMSG_REQUEST | HOMA_RECVMSG_RESPONSE,
 	}
 
 	unusedBuffers := s.bp.getUnusedBuffers()
 	args.NumBPages = uint32(len(unusedBuffers))
 	copy(args.BPageOffsets[:], unusedBuffers)
 
-	argsBytes := args.Bytes()
+	argsBytes := args.bytes()
 
-	length := -1
-	for length == -1 {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-s.dataAvailable:
-			var err error
-			length, _, _, _, err = unix.Recvmsg(s.fd, nil, argsBytes, 0)
-			if err != nil {
-				if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EINTR) {
-					continue
-				}
-
-				return nil, fmt.Errorf("could not receive message: %w", err)
-			}
-		}
+	recvHdr := unix.Msghdr{
+		Control:    &argsBytes[0],
+		Controllen: uint64(len(argsBytes)),
 	}
 
-	return NewMessage(s.bp, RecvmsgArgsFromBytes(argsBytes), int64(length)), nil
+	length, err := recvmsg(s.fd, &recvHdr, 0)
+	if err != nil {
+		if errors.Is(err, unix.EBADF) {
+			return nil, net.ErrClosed
+		}
+
+		return nil, fmt.Errorf("could not receive message: %w", err)
+	}
+
+	return NewMessage(s.bp, recvmsgArgsFromBytes(argsBytes), int64(length)), nil
 }
 
 // Send initiates an RPC by sending a request message to a server.
@@ -203,16 +156,16 @@ func (s *Socket) Send(dstAddr net.Addr, message []byte, completionCookie uint64)
 		CompletionCookie: completionCookie,
 	}
 
-	argsBytes := args.Bytes()
+	argsBytes := args.bytes()
 
-	name, nameLen, err := toRawSockAddr(dstAddr)
+	rawSockAddr, rawSockAddrLen, err := toRawSockAddr(dstAddr)
 	if err != nil {
 		return 0, fmt.Errorf("could not convert address: %w", err)
 	}
 
 	hdr := &unix.Msghdr{
-		Name:    name,
-		Namelen: uint32(nameLen),
+		Name:    (*byte)(rawSockAddr),
+		Namelen: rawSockAddrLen,
 		Iov:     &unix.Iovec{Base: &message[0], Len: uint64(len(message))},
 		Iovlen:  1,
 		Control: &argsBytes[0],
@@ -227,7 +180,7 @@ func (s *Socket) Send(dstAddr net.Addr, message []byte, completionCookie uint64)
 		return 0, fmt.Errorf("could not send message: %w", err)
 	}
 
-	args = SendmsgArgsFromBytes(argsBytes)
+	args = sendmsgArgsFromBytes(argsBytes)
 
 	return args.ID, nil
 }
@@ -240,16 +193,16 @@ func (s *Socket) Reply(dstAddr net.Addr, id uint64, message []byte) error {
 		ID: id,
 	}
 
-	argsBytes := args.Bytes()
+	argsBytes := args.bytes()
 
-	name, nameLen, err := toRawSockAddr(dstAddr)
+	rawSockAddr, rawSockAddrLen, err := toRawSockAddr(dstAddr)
 	if err != nil {
 		return fmt.Errorf("could not convert address: %w", err)
 	}
 
 	hdr := &unix.Msghdr{
-		Name:    name,
-		Namelen: uint32(nameLen),
+		Name:    (*byte)(rawSockAddr),
+		Namelen: rawSockAddrLen,
 		Iov:     &unix.Iovec{Base: &message[0], Len: uint64(len(message))},
 		Iovlen:  1,
 		Control: &argsBytes[0],
@@ -278,34 +231,4 @@ func (s *Socket) Abort(id uint64, errorCode int32) error {
 	}
 
 	return ioctl.Ioctl(uintptr(s.fd), HOMAIOCABORT, uintptr(unsafe.Pointer(&args)))
-}
-
-func setsockoptHomaBuf(fd int, args SetBufArgs) error {
-	_, _, errno := unix.Syscall6(unix.SYS_SETSOCKOPT, uintptr(fd), IPPROTO_HOMA, SO_HOMA_SET_BUF, uintptr(unsafe.Pointer(&args)), unsafe.Sizeof(args), 0)
-	if errno != 0 {
-		return errno
-	}
-
-	return nil
-}
-
-func toRawSockAddr(addr net.Addr) (*byte, int64, error) {
-	switch addr := addr.(type) {
-	case *net.UDPAddr:
-		if ipv4 := addr.IP.To4(); ipv4 != nil {
-			return (*byte)(unsafe.Pointer(&unix.RawSockaddrInet4{
-				Family: unix.AF_INET,
-				Port:   htons(uint16(addr.Port)),
-				Addr:   [4]byte(ipv4),
-			})), 16, nil
-		}
-
-		return (*byte)(unsafe.Pointer(&unix.RawSockaddrInet6{
-			Family: unix.AF_INET6,
-			Port:   htons(uint16(addr.Port)),
-			Addr:   [16]byte(addr.IP),
-		})), 28, nil
-	default:
-		return nil, 0, fmt.Errorf("unsupported address type: %T", addr)
-	}
 }

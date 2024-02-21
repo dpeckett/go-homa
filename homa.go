@@ -58,10 +58,10 @@ type SendmsgArgs struct {
 	CompletionCookie uint64
 }
 
-// SendmsgArgsFromBytes deserializes a sendmsgArgs from a byte slice.
+// sendmsgArgsFromBytes deserializes a sendmsgArgs from a byte slice.
 // We implement our own deserialization method here because the Go doesn't support packed structs
 // and binary.Read uses reflection, which is very slow.
-func SendmsgArgsFromBytes(buf []byte) SendmsgArgs {
+func sendmsgArgsFromBytes(buf []byte) SendmsgArgs {
 	var args SendmsgArgs
 	args.ID = binary.NativeEndian.Uint64(buf[0:8])
 	args.CompletionCookie = binary.NativeEndian.Uint64(buf[8:16])
@@ -69,10 +69,10 @@ func SendmsgArgsFromBytes(buf []byte) SendmsgArgs {
 	return args
 }
 
-// Bytes returns the byte representation of the sendmsgArgs, suitable for passing to the kernel.
+// bytes returns the byte representation of the sendmsgArgs, suitable for passing to the kernel.
 // We implement our own serialization method here because the Go doesn't support packed structs
 // and binary.Write uses reflection, which is very slow.
-func (s *SendmsgArgs) Bytes() []byte {
+func (s *SendmsgArgs) bytes() []byte {
 	var buf [16]byte
 	binary.NativeEndian.PutUint64(buf[0:8], s.ID)
 	binary.NativeEndian.PutUint64(buf[8:16], s.CompletionCookie)
@@ -121,10 +121,10 @@ type RecvmsgArgs struct {
 	BPageOffsets [HOMA_MAX_BPAGES]uint32
 }
 
-// RecvmsgArgsFromBytes deserializes a recvmsgArgs from a byte slice.
+// recvmsgArgsFromBytes deserializes a recvmsgArgs from a byte slice.
 // We implement our own deserialization method here because the Go doesn't support packed structs
 // and binary.Read uses reflection, which is very slow.
-func RecvmsgArgsFromBytes(buf []byte) RecvmsgArgs {
+func recvmsgArgsFromBytes(buf []byte) RecvmsgArgs {
 	var args RecvmsgArgs
 	args.ID = binary.NativeEndian.Uint64(buf[0:8])
 	args.CompletionCookie = binary.NativeEndian.Uint64(buf[8:16])
@@ -138,10 +138,10 @@ func RecvmsgArgsFromBytes(buf []byte) RecvmsgArgs {
 	return args
 }
 
-// Bytes returns the byte representation of the recvmsgArgs, suitable for passing to the kernel.
+// bytes returns the byte representation of the recvmsgArgs, suitable for passing to the kernel.
 // We implement our own serialization method here because the Go doesn't support packed structs
 // and binary.Write uses reflection, which is very slow.
-func (r *RecvmsgArgs) Bytes() []byte {
+func (r *RecvmsgArgs) bytes() []byte {
 	var buf [120]byte
 	binary.NativeEndian.PutUint64(buf[0:8], r.ID)
 	binary.NativeEndian.PutUint64(buf[8:16], r.CompletionCookie)
